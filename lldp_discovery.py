@@ -37,6 +37,7 @@ import logging.handlers
 from progressbar import ProgressBar
 import argparse
 import json
+import time
 
 DEBUG = True
 
@@ -95,7 +96,7 @@ SWITCH = 'UNKNOWN'
 STATE = 'UNKNOWN'
 VLANID = 'UNKNOWN'
 INVALID_INTERFACE_TYPES = ['bridge','veth','vlan','openvswitch',
-                           'tun','geneve','vxlan','gre']
+                           'tun','geneve','vxlan','gre','bond']
 
 # Setup logging
 log = logging.getLogger(__name__)
@@ -135,14 +136,6 @@ def detect_netdevs():
             # and append to list of interfaces to query
             if get_interface_kind(interface_name) not in INVALID_INTERFACE_TYPES:
                 netdevs.append((interface_name, interface_ip))
-#            try:
-#                interface_ip = inet_ntoa(
-#                                    ioctl(ip_gather_sock.fileno(), SIOCGIFADDR,
-#                                        pack('256s', interface_name[:15]))[20:24])
-#                 netdevs.append((interface_name, interface_ip))
-#            except IOError: # There is no ip assigned to this device, ignore.
-#                print "No IP assigned to %s. Ignoring!" % interface_name
-#                continue
 
     return netdevs
 
@@ -160,6 +153,19 @@ def promiscuous_mode(interface, sock, enable=False):
     else:
         ifr.ifr_flags &= ~IFF_PROMISC
     ioctl(sock.fileno(), SIOCSIFFLAGS, ifr)
+
+
+def toggle_interface(interface_name, state='up'):
+    """ Toggle interface """
+
+    ipr = IPRoute()
+
+    # lookup the index
+    dev = ipr.link_lookup(ifname=interface_name)[0]
+    ipr.link('set', index=dev, state=state)
+
+    log.debug("Interface %s is being toggled %s" % (interface_name, state))
+    ipr.close()
 
 
 def unpack_ethernet_frame(packet):
@@ -223,7 +229,7 @@ def exit_handler(signum, frame):
     interface_name = frame.f_locals['interface_name']
 
     promiscuous_mode(interface_name, capture_sock, False)
-    print("Abort, %s eixt promiscuous mode." % interface_name)
+    print("Abort, %s exit promiscuous mode." % interface_name)
 
     sys.exit(1)
 
@@ -233,6 +239,7 @@ def get_interface_state(interface_name):
         # Get interface state
         ip = IPRoute()
         state = ip.get_links(ip.link_lookup(ifname=interface_name))[0].get_attr('IFLA_OPERSTATE')
+        log.debug("Interface %s state is %s." % (interface_name, state))
         ip.close()
 
         return state
@@ -241,7 +248,7 @@ def get_interface_kind(interface_name):
 
         # Get interface state
         ip = IPRoute()
-#        kind = ip.get_links(ip.link_lookup(ifname=interface_name))[0].get_attr('IFLA_INFO_KIND')
+
         linkinfo = ip.get_links(ip.link_lookup(ifname=interface_name))[0].get_attr('IFLA_LINKINFO')
         if linkinfo is not None:
             kind = linkinfo.get_attr('IFLA_INFO_KIND')
@@ -262,37 +269,16 @@ def main():
                     help="Prints output to json")
     args = parser.parse_args()
 
-
-    max_capture_time = ADV_TIMEOUT
     rv = dict()
 
     netdevs = detect_netdevs()
-    # Grab the interface off the command line. Otherwise,
-    # pull from the system.
-#    if len(sys.argv) > 1:
-#        netdevs = list()
-#        netdevs.append((sys.argv[1],'0.0.0.0'))
-#    else:
-#        netdevs = detect_netdevs()
 
-#    capture_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
-
-    # Instantiate a progress bar and build a table if asked
+    # Build a table if asked
     if args.pretty:
         print "Polling interfaces for LLDP. This may take a bit..."
 
     for interface_name, interface_ip in netdevs:
 
-#        print "Polling interface %s. Timeout is %s seconds..." % (interface_name,ADV_TIMEOUT)
-#        print "Interface %s is kind: %s" % (interface_name,get_interface_kind(interface_name))
-#        if get_interface_kind(interface_name) in ['veth','bridge']:
-#            continue
-
-        # James
-        capture_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
-        capture_sock.bind((interface_name, 0))
-
-        promiscuous_mode(interface_name, capture_sock, True)
         rv[interface_name] = dict()
 
         state = get_interface_state(interface_name)
@@ -300,10 +286,24 @@ def main():
         kind = get_interface_kind(interface_name)
         rv[interface_name]['kind'] = kind
 
+        # Toggle if DOWN
+        if state is 'DOWN':
+            toggle = True
+            next_state = 'down'
+            toggle_interface(interface_name, 'up')
+            time.sleep(10)    # sleep to allow interface to change
+            state = get_interface_state(interface_name)
+        else:
+            toggle = False
+
+        capture_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
+        capture_sock.bind((interface_name, 0))
+
+        promiscuous_mode(interface_name, capture_sock, True)
 
         signal.signal(signal.SIGINT, exit_handler)
         signal.signal(signal.SIGALRM, exit_handler)
-        signal.alarm(max_capture_time)
+        signal.alarm(ADV_TIMEOUT)
 
         # Set defaults
         rv[interface_name]['portid'] = PORTID
@@ -315,7 +315,6 @@ def main():
             packet = capture_sock.recvfrom(65565)
             packet = packet[0]
 
-#            eth_protocol, eth_payload = unpack_ethernet_frame(packet)[3:]
             eth_dest_mac, eth_src_mac, eth_protocol, eth_payload = unpack_ethernet_frame(packet)[1:]
 
             # Convert tuple MAC to hex MAC
@@ -350,6 +349,10 @@ def main():
                             rv[interface_name]['vlan'] = re.sub(r'[\x00-\x08]', '', tlv_payload).strip()
 
                 break
+
+        # Reset interface state
+        if toggle:
+            toggle_interface(interface_name, state=next_state)
 
     # Build a table of results
     if args.pretty:
