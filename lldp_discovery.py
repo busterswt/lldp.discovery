@@ -35,6 +35,8 @@ import datetime
 import logging
 import logging.handlers
 from progressbar import ProgressBar
+import argparse
+import json
 
 DEBUG = True
 
@@ -252,25 +254,34 @@ def get_interface_kind(interface_name):
 def main():
     """ Low Level Discovery Protocol """
 
+    parser = argparse.ArgumentParser()
+    output = parser.add_mutually_exclusive_group(required=False)
+    output.add_argument("-p", "--pretty", action="store_true",
+                    help="Prints output to table")
+    output.add_argument("-j", "--json", action="store_true",
+                    help="Prints output to json")
+    args = parser.parse_args()
+
+
     max_capture_time = ADV_TIMEOUT
     rv = dict()
 
+    netdevs = detect_netdevs()
     # Grab the interface off the command line. Otherwise,
     # pull from the system.
-    if len(sys.argv) > 1:
-        netdevs = list()
-        netdevs.append((sys.argv[1],'0.0.0.0'))
-    else:
-        netdevs = detect_netdevs()
+#    if len(sys.argv) > 1:
+#        netdevs = list()
+#        netdevs.append((sys.argv[1],'0.0.0.0'))
+#    else:
+#        netdevs = detect_netdevs()
 
 #    capture_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
 
-    # Instantiate a progress bar
-    pbar = ProgressBar(term_width=60)
-    print "Polling interfaces for LLDP. This may take a bit..."
+    # Instantiate a progress bar and build a table if asked
+    if args.pretty:
+        print "Polling interfaces for LLDP. This may take a bit..."
 
-#    for interface_name, interface_ip in netdevs:
-    for interface_name, interface_ip in pbar(netdevs):
+    for interface_name, interface_ip in netdevs:
 
 #        print "Polling interface %s. Timeout is %s seconds..." % (interface_name,ADV_TIMEOUT)
 #        print "Interface %s is kind: %s" % (interface_name,get_interface_kind(interface_name))
@@ -341,14 +352,17 @@ def main():
                 break
 
     # Build a table of results
-    x = PrettyTable(["Interface", "State", "Kind", "Switch", "Port"])
-    x.padding_width = 1
+    if args.pretty:
+        x = PrettyTable(["Interface", "State", "Kind", "Switch", "Port", "VLAN"])
+        x.padding_width = 1
 
-    for int_name, int_details in rv.items():
-        x.add_row([int_name, int_details['state'], int_details['kind'],
-                   int_details['switch'], int_details['portid']])
+        for int_name, int_details in rv.items():
+            x.add_row([int_name, int_details['state'], int_details['kind'],
+                       int_details['switch'], int_details['portid'], int_details['vlan']])
 
-    print x
+        print x
+    elif args.json:
+        print json.dumps(rv)
 
 # Start:
 if __name__ == '__main__':
