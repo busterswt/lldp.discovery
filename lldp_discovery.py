@@ -26,6 +26,7 @@ from socket import AF_PACKET, AF_INET, SOCK_DGRAM, SOCK_RAW
 from socket import gaierror
 
 from struct import pack, unpack
+from pyroute2 import IPRoute
 
 ## Magic constants from `/usr/include/linux/if_ether.h`:
 ETH_P_ALL = 0x0003
@@ -194,6 +195,13 @@ def main():
     capture_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
 
     for interface_name, interface_ip in netdevs:
+
+        # Get interface state
+        ip = IPRoute()
+        state = ip.get_links(ip.link_lookup(ifname=interface_name))[0].get_attr('IFLA_OPERSTATE')
+        ip.close()
+
+        print "State: %s" % state
 
         promiscuous_mode(interface_name, capture_sock, True)
         rv[interface_name] = dict()
