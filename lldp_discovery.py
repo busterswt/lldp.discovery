@@ -13,6 +13,9 @@ Simple LLDP (Low Level Discovery Protocol) frame capture/parse script,
     3, No python 3 support in mind, just want to get the job done.
 
     Hope that someone find it useful, but WITHOUT ANY WARRANTY;
+
+Requirements:
+pip install pyroute2 PrettyTable progressbar
 """
 
 import re
@@ -27,6 +30,13 @@ from socket import gaierror
 
 from struct import pack, unpack
 from pyroute2 import IPRoute
+from prettytable import PrettyTable
+import datetime
+import logging
+import logging.handlers
+from progressbar import ProgressBar
+
+DEBUG = True
 
 ## Magic constants from `/usr/include/linux/if_ether.h`:
 ETH_P_ALL = 0x0003
@@ -73,6 +83,30 @@ SIOCGIFFLAGS = 0x8913   # `G` for Get socket flags
 SIOCSIFFLAGS = 0x8914   # `S` for Set socket flags
 IFF_PROMISC = 0x100     # Enter Promiscuous mode
 
+## Timers
+ADV_TIMER = 30        # Default LLDP advertisement timer is 30 seconds
+ADV_TIMEOUT = 45      # Timeout value (seconds) for LLDP advertisements
+
+## Defaults
+PORTID = 'UNKNOWN'
+SWITCH = 'UNKNOWN'
+STATE = 'UNKNOWN'
+VLANID = 'UNKNOWN'
+INVALID_INTERFACE_TYPES = ['bridge','veth','vlan','openvswitch',
+                           'tun','geneve','vxlan','gre']
+
+# Setup logging
+log = logging.getLogger(__name__)
+if DEBUG:
+    log.setLevel(logging.DEBUG)
+else:
+    log.setLevel(logging.INFO)
+
+handler = logging.handlers.SysLogHandler(address = '/dev/log')
+formatter = logging.Formatter('%(module)s.%(funcName)s: %(message)s')
+handler.setFormatter(formatter)
+
+log.addHandler(handler)
 
 class ifreq(Structure):
     """ C-compatible `ifreq` struct """
@@ -81,7 +115,7 @@ class ifreq(Structure):
 
 
 def detect_netdevs():
-    """ Get network interface name/ip, 
+    """ Get network interface name/ip,
             ignore interface with no ip assigned """
 
     netdevs = list()
@@ -91,15 +125,22 @@ def detect_netdevs():
     fp = open(NETDEV_INFO, 'ro')
     for interface in fp:
         m = re.match(netdev_regex, interface)
+        interface_ip = '0.0.0.0'
         if m and 'lo' not in m.group(1):
             interface_name = m.group(1).strip()
-            try:
-                interface_ip = inet_ntoa(
-                                    ioctl(ip_gather_sock.fileno(), SIOCGIFADDR, 
-                                        pack('256s', interface_name[:15]))[20:24])
+
+            # Check to see if the interface is interesting to us
+            # and append to list of interfaces to query
+            if get_interface_kind(interface_name) not in INVALID_INTERFACE_TYPES:
                 netdevs.append((interface_name, interface_ip))
-            except IOError: # There is no ip assigned to this device, ignore.
-                continue
+#            try:
+#                interface_ip = inet_ntoa(
+#                                    ioctl(ip_gather_sock.fileno(), SIOCGIFADDR,
+#                                        pack('256s', interface_name[:15]))[20:24])
+#                 netdevs.append((interface_name, interface_ip))
+#            except IOError: # There is no ip assigned to this device, ignore.
+#                print "No IP assigned to %s. Ignoring!" % interface_name
+#                continue
 
     return netdevs
 
@@ -147,17 +188,17 @@ def unpack_lldp_frame(eth_payload):
         tlv_data_len = (tlv_header[0] & LLDP_TLV_LEN_MASK)
         tlv_payload = eth_payload[LLDP_TLV_HEADER_LEN:LLDP_TLV_HEADER_LEN + tlv_data_len]
 
-        # These headers only available with 
+        # These headers only available with
         #   `LLDP_TLV_ORGANIZATIONALLY_SPECIFIC` TLV
         tlv_oui = None
         tlv_subtype = None
 
         if tlv_type == LLDP_TLV_ORGANIZATIONALLY_SPECIFIC:
             _tlv_oui = unpack(UNPACK_LLDP_TLV_OUI, tlv_payload[:LLDP_TLV_OUI_LEN])
-            tlv_subtype = unpack(UNPACK_LLDP_TLV_SUBTYPE, 
+            tlv_subtype = unpack(UNPACK_LLDP_TLV_SUBTYPE,
                             tlv_payload[LLDP_TLV_OUI_LEN:LLDP_TLV_OUI_LEN + LLDP_TLV_SUBTYPE_LEN])[0]
             tlv_payload = tlv_payload[LLDP_TLV_OUI_LEN + LLDP_TLV_SUBTYPE_LEN:]
-                
+
             # Covert oui from list to hex/decimals
             tlv_oui = str()
             for bit in _tlv_oui:
@@ -171,7 +212,7 @@ def unpack_lldp_frame(eth_payload):
 
         yield (tlv_header, tlv_type, tlv_data_len, tlv_oui, \
                                         tlv_subtype, tlv_payload)
-    
+
 
 def exit_handler(signum, frame):
     """ Exit signal handler """
@@ -185,38 +226,96 @@ def exit_handler(signum, frame):
     sys.exit(1)
 
 
-def main():
-    """ Low Level Discovery Protocol """
-
-    max_capture_time = 45
-    rv = dict()
-
-    netdevs = detect_netdevs()
-    capture_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
-
-    for interface_name, interface_ip in netdevs:
+def get_interface_state(interface_name):
 
         # Get interface state
         ip = IPRoute()
         state = ip.get_links(ip.link_lookup(ifname=interface_name))[0].get_attr('IFLA_OPERSTATE')
         ip.close()
 
-        print "State: %s" % state
+        return state
+
+def get_interface_kind(interface_name):
+
+        # Get interface state
+        ip = IPRoute()
+#        kind = ip.get_links(ip.link_lookup(ifname=interface_name))[0].get_attr('IFLA_INFO_KIND')
+        linkinfo = ip.get_links(ip.link_lookup(ifname=interface_name))[0].get_attr('IFLA_LINKINFO')
+        if linkinfo is not None:
+            kind = linkinfo.get_attr('IFLA_INFO_KIND')
+        else:
+            kind = 'n/a'
+        ip.close()
+
+        return kind
+
+def main():
+    """ Low Level Discovery Protocol """
+
+    max_capture_time = ADV_TIMEOUT
+    rv = dict()
+
+    # Grab the interface off the command line. Otherwise,
+    # pull from the system.
+    if len(sys.argv) > 1:
+        netdevs = list()
+        netdevs.append((sys.argv[1],'0.0.0.0'))
+    else:
+        netdevs = detect_netdevs()
+
+#    capture_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
+
+    # Instantiate a progress bar
+    pbar = ProgressBar(term_width=60)
+    print "Polling interfaces for LLDP. This may take a bit..."
+
+#    for interface_name, interface_ip in netdevs:
+    for interface_name, interface_ip in pbar(netdevs):
+
+#        print "Polling interface %s. Timeout is %s seconds..." % (interface_name,ADV_TIMEOUT)
+#        print "Interface %s is kind: %s" % (interface_name,get_interface_kind(interface_name))
+#        if get_interface_kind(interface_name) in ['veth','bridge']:
+#            continue
+
+        # James
+        capture_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL))
+        capture_sock.bind((interface_name, 0))
 
         promiscuous_mode(interface_name, capture_sock, True)
         rv[interface_name] = dict()
+
+        state = get_interface_state(interface_name)
+        rv[interface_name]['state'] = state
+        kind = get_interface_kind(interface_name)
+        rv[interface_name]['kind'] = kind
+
 
         signal.signal(signal.SIGINT, exit_handler)
         signal.signal(signal.SIGALRM, exit_handler)
         signal.alarm(max_capture_time)
 
-        while True:
+        # Set defaults
+        rv[interface_name]['portid'] = PORTID
+        rv[interface_name]['switch'] = SWITCH
+        rv[interface_name]['vlan'] = VLANID
+
+        while True and state is 'UP':
 
             packet = capture_sock.recvfrom(65565)
             packet = packet[0]
-            eth_protocol, eth_payload = unpack_ethernet_frame(packet)[3:]
+
+#            eth_protocol, eth_payload = unpack_ethernet_frame(packet)[3:]
+            eth_dest_mac, eth_src_mac, eth_protocol, eth_payload = unpack_ethernet_frame(packet)[1:]
+
+            # Convert tuple MAC to hex MAC
+            hex_src_mac = ':'.join(covert_hex_string(list(eth_src_mac)))
+            hex_dest_mac = ':'.join(covert_hex_string(list(eth_dest_mac)))
 
             if eth_protocol == LLDP_PROTO_ID:
+
+                log.debug("%s %s - SRC: %s, DEST: %s, Ethernet Protocol: %s" %
+                                (datetime.datetime.utcnow(),interface_name,
+                                hex_src_mac,hex_dest_mac,eth_protocol))
 
                 promiscuous_mode(interface_name, capture_sock, False)
                 signal.signal(signal.SIGINT, signal.SIG_DFL)
@@ -228,6 +327,9 @@ def main():
                     tlv_header, tlv_type, tlv_data_len, tlv_oui, tlv_subtype, tlv_payload \
                                                                             = tlv_parse_rv
 
+                    log.debug("%s, %s, %s, %s, %s, %s" %
+                                    (tlv_header, tlv_type, tlv_data_len, tlv_oui, tlv_subtype, tlv_payload))
+
                     if tlv_type == LLDP_TLV_TYPE_PORTID:
                         rv[interface_name]['portid'] = re.sub(r'[\x00-\x08]', '', tlv_payload).strip()
                     elif tlv_type == LLDP_TLV_DEVICE_NAME:
@@ -238,7 +340,15 @@ def main():
 
                 break
 
-    print(rv)
+    # Build a table of results
+    x = PrettyTable(["Interface", "State", "Kind", "Switch", "Port"])
+    x.padding_width = 1
+
+    for int_name, int_details in rv.items():
+        x.add_row([int_name, int_details['state'], int_details['kind'],
+                   int_details['switch'], int_details['portid']])
+
+    print x
 
 # Start:
 if __name__ == '__main__':
